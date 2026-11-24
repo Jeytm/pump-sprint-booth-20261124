@@ -1,18 +1,22 @@
-// Pump.fun Paper Sprint — launch scalper (agent-fun/replay/v2).
+// Pump.fun Paper Sprint — hot-launch sniper, v2 (agent-fun/replay/v2).
 //
-// Idea: a bonding curve is cheapest at birth, before anyone else has bought.
-// This bot watches every CreateEvent, buys a small stake in launches that pass
-// a rug filter (creator did not load up, creator has not sold, not bundled by
-// many wallets, no big early sell), then exits fast: +20% take-profit, -8%
-// stop-loss, or 15 slots, whichever comes first. Losers are tiny and quick;
-// winners are banked before the dump. A probe backstop keeps the run above the
-// guardrail (round trips of >=0.01 SOL on >=20 coins) when launches are scarce.
+// v1 bought every fresh launch that passed a rug filter and lost -0.434 SOL on
+// the dev window: 381 mostly-cold coins, 14% win rate, fees eating the edge.
+// v2 buys ONLY launches that are already hot in their first slots — real SOL
+// piling in fast (20+ SOL within 5 slots), several distinct buyers, no single
+// wallet dominating the early buys (a bundle setup) — then banks a fast
+// take-profit (+15%), cuts losers fast (-6%), and never holds past 10 slots.
+// Research on the dev window: coins with >10 SOL real at age 5 reach +20%
+// 17.5% of the time by slot 30 and complete 16% of the time, vs 6.7% / 3.1%
+// for the average coin; coins with <1 SOL real at age 5 are dead (0.7% ever
+// reach +20%). Local sim (full dev window): +0.191 SOL, 64 coins, maxDD 2%,
+// vs -0.459 for v1 in the same sim.
 //
 // Deterministic by construction: no clock, no Math.random, no environment;
 // all state lives in module-level maps fed by the batch stream, iterated in
 // insertion order. Every decision is a pure function of the events seen so far.
 
-import { runBot, LAMPORTS_PER_SOL, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
+import { runBot, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
 
 const LAMPORTS = 1e9;
 // Curve fee on a sell (protocol 95 bps + creator 30 bps).
@@ -20,18 +24,22 @@ const CURVE_FEE = 0.0125;
 
 // ---- tunables -------------------------------------------------------------
 const MAX_ENTRY_AGE = 5; // slots since CreateEvent; only fresh launches
-const STAKE_SOL = 0.08; // SOL per launch
+const STAKE_SOL = 0.25; // SOL per launch (capped at 1% of real reserves)
 const MIN_BUY_SOL = 0.005; // smallest buy worth paying the tx fee for
-const MIN_RQ_SOL = 0.2; // real SOL reserves at entry, lower bound
-const MAX_RQ_SOL = 25; // real SOL reserves at entry, upper bound
+const MIN_RQ_SOL = 20; // real SOL reserves at entry, lower bound: HOT only
+const MAX_RQ_SOL = 60; // real SOL reserves at entry, upper bound
+const MIN_BUYERS = 5; // distinct non-creator buyers at entry, at least
+const MAX_BUYERS = 12; // distinct non-creator buyers at entry, at most
+const MIN_BUYS_SOL = 0.5; // non-creator SOL bought before entry, at least
 const MAX_DEV_BUY_SOL = 2; // creator's own buy in the create slot, at most
-const MAX_BUYERS = 4; // distinct non-creator buyers at entry, at most
+const MAX_BUYER_SHARE = 0.4; // one wallet's share of early buys, at most
 const BUY_SLIP_BPS = 10_000; // wide: never refuse a launch buy on latency
-const TAKE_PROFIT = 0.2; // sell when value >= cost * (1 + TAKE_PROFIT)
-const STOP_LOSS = 0.08; // sell when value < cost * (1 - STOP_LOSS)
+const TAKE_PROFIT = 0.15; // sell when value >= cost * (1 + TAKE_PROFIT)
+const STOP_LOSS = 0.06; // sell when value < cost * (1 - STOP_LOSS)
 const TRAIL_ARM = 0.1; // trailing stop arms once value >= cost * (1 + TRAIL_ARM)
 const TRAIL = 0.15; // sell when value < peak * (1 - TRAIL)
-const MAX_HOLD = 15; // slots; exit after this no matter what
+const MAX_HOLD = 10; // slots; exit after this no matter what
+const EXIT_BIG_SELL_SOL = 1; // exit at once on a single sell this big (SOL)
 const MAX_MAIN = 5;
 // Guardrail pacing: the run must end with round trips on >=20 coins. When the
 // bot's own fills or coins lag the pace, open tiny probe round trips.
@@ -50,6 +58,9 @@ interface Coin {
   boughtSol: number;
   soldByOthersSol: number;
   biggestSellShare: number; // largest single non-creator sell, share of real SOL
+  bigSellSol: number; // largest single non-creator sell (SOL) since entry
+  bigSellSlot: number;
+  buysByUser: Map<Pubkey, number>; // non-creator buy SOL by wallet
   done: boolean;
 }
 
@@ -93,6 +104,9 @@ await runBot({
           boughtSol: 0,
           soldByOthersSol: 0,
           biggestSellShare: 0,
+          bigSellSol: 0,
+          bigSellSlot: -1,
+          buysByUser: new Map(),
           done: false,
         });
         fresh.add(e.mint);
@@ -104,11 +118,18 @@ await runBot({
         if (e.is_buy) {
           c.boughtSol += sol;
           if (isDev && e.slot === c.created) c.devBuySol += sol;
-          else if (!isDev) c.buyers.add(e.user);
+          else if (!isDev) {
+            c.buyers.add(e.user);
+            c.buysByUser.set(e.user, (c.buysByUser.get(e.user) ?? 0) + sol);
+          }
         } else if (isDev) {
           c.devSold = true;
         } else {
           c.soldByOthersSol += sol;
+          if (sol > c.bigSellSol) {
+            c.bigSellSol = sol;
+            c.bigSellSlot = e.slot;
+          }
           const rqBefore = Number(e.real_quote_reserves) / LAMPORTS + sol;
           if (rqBefore > 0) {
             const share = sol / rqBefore;
@@ -164,6 +185,7 @@ await runBot({
       if (!exit && now - h.opened >= MAX_HOLD) exit = true;
       const c = coins.get(mint);
       if (!exit && c !== undefined && c.devSold) exit = true;
+      if (!exit && c !== undefined && c.bigSellSlot >= h.opened && c.bigSellSol >= EXIT_BIG_SELL_SOL) exit = true;
       if (!exit) continue;
       if (pendingByMint.has(mint)) {
         let sellPending = false;
@@ -190,7 +212,7 @@ await runBot({
       probes.set(mint, true);
     }
 
-    // ---- entries: fresh launches that pass the rug filter -----------------
+    // ---- entries: hot launches only ---------------------------------------
     let free = Number(state.freeCashLamports()) / LAMPORTS;
     let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
     let mainLeft = MAX_MAIN - held.size;
@@ -204,13 +226,18 @@ await runBot({
       if (age < 0 || age > MAX_ENTRY_AGE) continue;
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
-      // Rug filter.
+      // Hot-launch filter: real SOL already piled in fast, several distinct
+      // buyers, meaningful non-creator buying, no single wallet dominating
+      // the early buys (a bundle setting up a dump), no dump signals.
       const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
       if (rqSol < MIN_RQ_SOL || rqSol > MAX_RQ_SOL) continue;
       if (c.devBuySol > MAX_DEV_BUY_SOL) continue;
       if (c.devSold) continue;
-      if (c.buyers.size > MAX_BUYERS) continue;
-      if (c.buyers.size < 1) continue; // someone besides the creator must have bought
+      if (c.buyers.size < MIN_BUYERS || c.buyers.size > MAX_BUYERS) continue;
+      if (c.boughtSol < MIN_BUYS_SOL) continue;
+      let topBuyer = 0;
+      for (const v of c.buysByUser.values()) if (v > topBuyer) topBuyer = v;
+      if (c.boughtSol > 0 && topBuyer / c.boughtSol > MAX_BUYER_SHARE) continue;
       if (c.boughtSol > 0 && c.soldByOthersSol > c.boughtSol) continue;
       if (c.biggestSellShare > 0.5) continue;
       const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
